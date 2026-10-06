@@ -1,0 +1,332 @@
+#pragma kernel ConvertToLab
+#pragma kernel InitSuperPixels
+#pragma kernel AssignPixels
+#pragma kernel ClearAccum
+#pragma kernel AccumulatePixels
+#pragma kernel UpdateCenters
+#pragma kernel RenderBorders
+#pragma kernel RenderColors
+#pragma kernel BlurPixels
+#pragma kernel CopyBlurred
+#pragma kernel AssignPalette
+#pragma kernel RenderCanvas
+#pragma kernel RenderSuperPixelTexture
+#include "SuperPixelCommon.hlsl"
+
+Texture2D<float4> _SourceTexture; // downscaled image (only used by ConvertToLab)
+RWTexture2D<float4> _ColorOutput; // superpixel colors
+RWTexture2D<float4> _BorderOutput; // white borders on black
+
+// ---------------------------------------------------------------------
+// 1. Convert the image to CIELAB ONCE (so the iterations never repeat it)
+// ---------------------------------------------------------------------
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void ConvertToLab(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    float3 c = _SourceTexture.Load(int3(id.x, id.y, 0)).rgb;
+
+    // Linear project: the texture is already linear -> do NOT linearize again (the bug from the video).
+    float3 lin = (_InputIsGamma != 0) ? SRGBToLinear(c) : c;
+    _Pixels[pixelID] = LinearRGBToLab(lin);
+}
+
+// ---------------------------------------------------------------------
+// 2. Place superpixel centers on a regular grid
+// ---------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void InitSuperPixels(uint3 id : SV_DispatchThreadID)
+{
+    uint superPixelID;
+    if (!GetSuperPixelID(id, superPixelID))
+        return;
+
+    int col = (int) (superPixelID % _GridSize);
+    int row = (int) (superPixelID / _GridSize);
+
+    int x = _SuperPixelSizeX / 2 + _SuperPixelSizeX * col;
+    int y = _SuperPixelSizeY / 2 + _SuperPixelSizeY * row;
+    x = min(x, (int) _Width - 1);
+    y = min(y, (int) _Height - 1);
+
+    _SuperPixels[superPixelID] = NewSuperPixel(float2(x, y), GetPixel(y * _Width + x));
+}
+
+// ---------------------------------------------------------------------
+// 3. Assign every pixel to the nearest superpixel (color distance + spatial distance)
+// ---------------------------------------------------------------------
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void AssignPixels(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    float3 color = GetPixel(pixelID);
+    float2 pos = float2(id.xy);
+    float2 size = float2(_SuperPixelSizeX, _SuperPixelSizeY);
+
+    int nearest = 0;
+    float minDistSqr = 3.402823e+38;
+
+    for (uint i = 0; i < _NumSuperPixels; i++)
+    {
+        SuperPixel sp = _SuperPixels[i];
+
+        float distLab = distance(color, sp.color) / _ColorWeighting;
+        float2 distXY = (pos - sp.coord) / size;
+        float distSqr = distLab * distLab + dot(distXY, distXY);
+
+        if (distSqr >= minDistSqr)
+            continue;
+
+        minDistSqr = distSqr;
+        nearest = (int) i;
+    }
+
+    _SuperPixelIndices[pixelID] = nearest;
+}
+
+// ---------------------------------------------------------------------
+// 4. Move each center to the mean position/color of its pixels.
+//    Pixels add themselves into an accumulator with atomics (fixed point),
+//    which is much faster than one thread per cluster scanning the whole image.
+// ---------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void ClearAccum(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NumSuperPixels * ACCUM_STRIDE)
+        return;
+
+    _Accum[id.x] = 0;
+}
+
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void AccumulatePixels(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    uint b = (uint) _SuperPixelIndices[pixelID] * ACCUM_STRIDE;
+    int3 fixedColor = (int3) round(GetPixel(pixelID) * COLOR_FIXED_SCALE);
+
+    InterlockedAdd(_Accum[b + 0], fixedColor.x);
+    InterlockedAdd(_Accum[b + 1], fixedColor.y);
+    InterlockedAdd(_Accum[b + 2], fixedColor.z);
+    InterlockedAdd(_Accum[b + 3], (int) id.x);
+    InterlockedAdd(_Accum[b + 4], (int) id.y);
+    InterlockedAdd(_Accum[b + 5], 1);
+}
+
+[numthreads(64, 1, 1)]
+void UpdateCenters(uint3 id : SV_DispatchThreadID)
+{
+    uint superPixelID;
+    if (!GetSuperPixelID(id, superPixelID))
+        return;
+
+    uint b = superPixelID * ACCUM_STRIDE;
+    int count = _Accum[b + 5];
+
+    // An empty superpixel keeps its previous center
+    if (count <= 0)
+        return;
+
+    float n = (float) count;
+    SuperPixel sp;
+    sp.coord = float2(_Accum[b + 3], _Accum[b + 4]) / n;
+    sp.color = float3(_Accum[b + 0], _Accum[b + 1], _Accum[b + 2]) / (COLOR_FIXED_SCALE * n);
+    _SuperPixels[superPixelID] = sp;
+}
+
+// ---------------------------------------------------------------------
+// 5. Visualisation
+// ---------------------------------------------------------------------
+bool IsBorder(uint2 xy, int superPixelID)
+{
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            int2 n = int2(xy) + int2(x, y);
+            if (n.x < 0 || n.y < 0 || n.x >= (int) _Width || n.y >= (int) _Height)
+                continue;
+
+            if (_SuperPixelIndices[n.y * (int) _Width + n.x] != superPixelID)
+                return true; // a neighbor belongs to another superpixel
+        }
+    }
+    return false;
+}
+
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void RenderBorders(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    int superPixelID = _SuperPixelIndices[pixelID];
+    float result = IsBorder(id.xy, superPixelID) ? 1 : 0;
+
+    _BorderOutput[id.xy] = float4(result.xxx, 1);
+}
+
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void RenderColors(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    float3 lab = _SuperPixels[_SuperPixelIndices[pixelID]].color;
+
+    // The output texture holds sRGB-encoded bytes, same as the Texture2D in KMeansUI.
+    _ColorOutput[id.xy] = float4(LinearToSRGB(LabToLinearRGB(lab)), 1);
+}
+
+// ---------------------------------------------------------------------
+// 6. Blur: simple 3x3 average of the Lab image, run before each iteration
+//    so tiny islands get smoothed away (the "Blur" part of the video).
+// ---------------------------------------------------------------------
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void BlurPixels(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    int2 maxXY = int2((int) _Width - 1, (int) _Height - 1);
+    float3 sum = float3(0, 0, 0);
+
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            int2 n = clamp(int2(id.xy) + int2(x, y), int2(0, 0), maxXY);
+            sum += _Pixels[n.y * (int) _Width + n.x];
+        }
+    }
+
+    _PixelsTemp[pixelID] = sum / 9.0;
+}
+
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void CopyBlurred(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    _Pixels[pixelID] = _PixelsTemp[pixelID];
+}
+
+// ---------------------------------------------------------------------
+// 7. Give every superpixel its nearest palette color (Lab distance)
+// ---------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void AssignPalette(uint3 id : SV_DispatchThreadID)
+{
+    uint superPixelID;
+    if (!GetSuperPixelID(id, superPixelID))
+        return;
+
+    float3 lab = _SuperPixels[superPixelID].color;
+
+    int best = 0;
+    float minDist = 3.402823e+38;
+    for (uint i = 0; i < _NumPalette; i++)
+    {
+        float3 d = lab - _PaletteLab[i];
+        float dist = dot(d, d);
+        if (dist < minDist)
+        {
+            minDist = dist;
+            best = (int) i;
+        }
+    }
+
+    _SuperPixelPalette[superPixelID] = best;
+}
+
+// ---------------------------------------------------------------------
+// 8. Paint-by-numbers canvas: borders only where the PALETTE color changes,
+//    so neighboring superpixels with the same palette color merge.
+// ---------------------------------------------------------------------
+RWTexture2D<float4> _CanvasOutput;
+
+int PaletteAt(int2 p)
+{
+    return _SuperPixelPalette[_SuperPixelIndices[p.y * (int) _Width + p.x]];
+}
+
+bool IsPaletteBorder(uint2 xy, int paletteIdx)
+{
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            int2 n = int2(xy) + int2(x, y);
+            if (n.x < 0 || n.y < 0 || n.x >= (int) _Width || n.y >= (int) _Height)
+                continue;
+
+            if (PaletteAt(n) != paletteIdx)
+                return true;
+        }
+    }
+    return false;
+}
+
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void RenderCanvas(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    int pal = PaletteAt(int2(id.xy));
+    float3 rgb = _PaletteRGB[pal];
+
+    float3 color = float3(1, 1, 1); // blank canvas
+
+    if (_ShowColors != 0)
+    {
+        color = rgb;
+        // While hovering a swatch, fade every other region toward white
+        if (_Highlight >= 0 && pal != _Highlight)
+            color = lerp(rgb, float3(1, 1, 1), 0.65);
+    }
+    else if (pal == _Highlight)
+    {
+        color = rgb; // blank canvas: only the hovered region is filled
+    }
+
+    if (IsPaletteBorder(id.xy, pal))
+        color = float3(0.15, 0.15, 0.15);
+
+    _CanvasOutput[id.xy] = float4(color, 1);
+}
+
+// ---------------------------------------------------------------------
+// 9. One pixel per superpixel (grid x grid texture). K-means clusters THIS
+//    instead of every pixel of the image: a few hundred points instead of millions.
+// ---------------------------------------------------------------------
+RWTexture2D<float4> _SuperPixelOutput;
+
+[numthreads(64, 1, 1)]
+void RenderSuperPixelTexture(uint3 id : SV_DispatchThreadID)
+{
+    uint superPixelID;
+    if (!GetSuperPixelID(id, superPixelID))
+        return;
+
+    uint2 xy = uint2(superPixelID % _GridSize, superPixelID / _GridSize);
+    float3 lab = _SuperPixels[superPixelID].color;
+
+    // Same encoding as the other output textures (sRGB values, see RenderColors)
+    _SuperPixelOutput[xy] = float4(LinearToSRGB(LabToLinearRGB(lab)), 1);
+}

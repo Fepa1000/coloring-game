@@ -1,0 +1,43 @@
+#pragma kernel InitClusters
+#pragma kernel ConvertToWorkingSpace
+#include "KMeansCommon.hlsl"
+
+uint _Seed;
+Texture2D<float4> _SourceTexture; // the downscaled image (only used by ConvertToWorkingSpace)
+
+// Converts the image ONCE per run (RGB -> RGB or Lab) so the iterations never repeat the math.
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void ConvertToWorkingSpace(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    _Pixels[pixelID] = ToWorkingSpace(_SourceTexture.Load(int3(id.x, id.y, 0)).rgb);
+}
+
+// Simple pseudo-random helper
+float random(float2 st)
+{
+    return frac(sin(dot(st, float2(12.9898, 78.233))) * 43758.5453123);
+}
+
+[numthreads(64, 1, 1)]
+void InitClusters(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NumClusters)
+        return;
+
+    float seed = (float) (_Seed % 9973u);
+
+    float2 rnd = float2(
+        random(float2(id.x + seed, 1.0)),
+        random(float2(id.x * 12.873 + seed, 2.0))
+    );
+
+    // Pick a random pixel (already in the working space) as the starting center
+    uint2 xy = (uint2) (rnd * float2(_Width, _Height));
+    xy = min(xy, uint2(_Width - 1, _Height - 1));
+
+    _Clusters[id.x] = GetPixel(xy.y * _Width + xy.x);
+}

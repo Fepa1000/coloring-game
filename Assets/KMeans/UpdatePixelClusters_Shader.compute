@@ -1,0 +1,29 @@
+#pragma kernel UpdatePixelClusters
+#include "KMeansCommon.hlsl"
+
+[numthreads(CLUSTERING_THREAD_SIZE, CLUSTERING_THREAD_SIZE, 1)]
+void UpdatePixelClusters(uint3 id : SV_DispatchThreadID)
+{
+    uint pixelID;
+    if (!GetPixelID(id, pixelID))
+        return;
+
+    float3 color = GetPixel(pixelID);
+
+    // Find the nearest cluster using the selected metric (RGB, Delta E 76 or Delta E 94)
+    int nearestCluster = 0;
+    float minDist = 3.402823e+38;
+
+    for (uint i = 0; i < _NumClusters; i++)
+    {
+        float dist = ColorDistanceSq(color, _Clusters[i]);
+
+        if (dist < minDist)
+        {
+            minDist = dist;
+            nearestCluster = (int) i;
+        }
+    }
+
+    _ClusterIndeces[pixelID] = nearestCluster;
+}

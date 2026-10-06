@@ -1,0 +1,29 @@
+#pragma kernel UpdateClusterCenter
+#include "KMeansCommon.hlsl"
+
+[numthreads(64, 1, 1)]
+void UpdateClusterCenter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NumClusters)
+        return;
+
+    int clusterId = (int)id.x;
+    float3 sum = float3(0, 0, 0);
+    uint count = 0;
+
+    uint totalPixelCount = GetTotalPixels();
+
+    // One thread per cluster, scanning every pixel (slow but simple, as in the video)
+    for (uint i = 0; i < totalPixelCount; i++)
+    {
+        if (_ClusterIndeces[i] != clusterId)
+            continue;
+
+        sum += GetPixel(i);
+        count++;
+    }
+
+    // An empty cluster keeps its previous center instead of collapsing to black
+    if (count > 0)
+        _Clusters[id.x] = sum / (float)count;
+}
